@@ -1,0 +1,15 @@
+plan
+rsm/
+├── Cargo.toml
+├── crates/
+│   ├── rsm-core/        # types, constants, shared structs (replaces include/)
+│   ├── rsm-db/          # database engine (replaces database/)
+│   ├── rsm-compiler/    # M language compiler (replaces compile/)
+│   ├── rsm-runtime/     # interpreter/executor (replaces runtime/)
+│   ├── rsm-symbol/      # symbol table (replaces symbol/)
+│   ├── rsm-seqio/       # sequential I/O (replaces seqio/)
+│   ├── rsm-init/        # environment init/shutdown (replaces init/)
+│   ├── rsm-xcall/       # external calls (replaces xcall/)
+│   └── rsm-util/        # utilities (replaces util/)
+└── src/
+    └── main.rs # CLI 
