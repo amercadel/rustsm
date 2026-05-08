@@ -1,5 +1,8 @@
 use std::ptr::NonNull;
 
+mod database;
+mod compile;
+
 #[macro_export]
 macro_rules! RSM_STRING {
     ($x:expr) => {
@@ -167,6 +170,7 @@ pub const HISTORIC_EOK: u8 = 1; // E number syntax OK
 pub const HISTORIC_OFFOK: u8 = 2; // GO/DO with offset OK
 pub const HISTORIC_DNOK: u8 = 4; // $NEXT OK
 
+pub const MAX_MAP_SIZE: u16 = (MAX_DATABASE_BLKS / 8 + std::mem::size_of(LabelBlock)) / 1024 + 1;
 
 /* 
 semaphore defines
@@ -183,7 +187,26 @@ pub const SEM_WD: u8 = 4; // Write daemons
 pub const SEM_ATOMIC: u8 = 5; // Atomic operations
 pub const SEM_MAX: u8 = 6; // total number of these
 
+// semaphore defines
+pub const SEM_READ: i16 = -1;  // read lock
 
+// these 3 functions are implemented with a raw pointer in the original implementation, but I #don't want to do that
+// defining these as functions that can be called at runtime
+
+// write lock
+pub fn sem_write(systab: &SysTab) -> i32 {
+    (-(systab.maxjob as i32))
+}
+// from read to write
+pub fn sem_r_wr(systab: &SysTab) -> i32 {
+    (-(systab.maxjob - 1) as i32)
+}
+// from write to read
+pub fn sem_wr_to_r(systab: &SysTab) -> i32 {
+    (systab.maxjob - 1) as i32
+}
+
+pub const MAX_TRANTAB: u8 = 64;
 
 // #[repr(C, packed)]
 // pub struct systab {
@@ -191,8 +214,8 @@ pub const SEM_MAX: u8 = 6; // total number of these
 //     // pub jobtab: *mut
 // }
 
-#[rep(C, packed)]
-pub struct jobtab {
+
+pub struct JobTab {
     pub pid: i32, // OS PID (0 if unused)
     pub cur_do: i32, // current do frame address
     pub commands: u32, // commands executed
@@ -217,21 +240,21 @@ pub struct jobtab {
     pub last_ref: mvar, // $REFERENCE 
     pub start_len: i16, // length start data  
     pub start_dh: [u8; 14], // store start time here
-    pub dostk: [do_frame; MAX_DO_FRAMES + 1], // the do stack (0 - 126 and STM1_FRAME)
-    pub seqio: [SQ_Chan; MAX_SEQ_IO],
-    // pub view: [*mut Gbd; MAX_VOL], // can be defined in rsm-core/database.rs ~ database.h
+    pub dostk: [DoFrame; MAX_DO_FRAMES + 1], // the do stack (0 - 126 and STM1_FRAME)
+    pub seqio: [SQChan; MAX_SEQ_IO],
+    pub view: [*mut database::Gbd; MAX_VOL], // defined in rsm-core/database.rs ~ database.h
 }
 
-// in reference implementation, author uses a union because the variable can be stored in 3 different waus
+// in reference implementation, author uses a union because the variable can be stored in 3 different ways
 // u_int64 var_q
 // u_int64 var_qu[VARLEN / 8]
 // u_char var_cu[VARLEN]
 // for now, this will be implemented more simply, but will potentially change as needed
-pub struct var_u {
+pub struct VarU {
     pub var_q: [u64; VARLEN] // just storing an array of bytes
 }
 
-pub struct mvar {
+pub struct MVar {
     pub name: var_u, // variable name
     pub volset: u8, // volset number
     pub uci: u8, // UCI number -> 255 = local variable
@@ -239,7 +262,7 @@ pub struct mvar {
     pub key: [u8; MAX_KEY_SIZE + 1] // the subs (key) - allow for 0
 }
 
-pub struct do_frame {
+pub struct DoFrame {
     pub routine: &mut [u8], // address of routine (or xecute source)
     pub pc: &mut [u8], // current RSM pc
     pub symbol: &mut [i16], // process space symbol table pointers
@@ -260,12 +283,35 @@ pub struct do_frame {
     pub isp: u64 // do frame
 }
 
-pub struct SQ_Chan {
+// **************************************************************
+// Generated with Claude, wasn't sure the best way to rewrite this
+#[cfg(not(any(target_os = "macos", target_os = "openbsd")))]
+pub struct Semun {
+    pub val: i32,
+    pub buf: *mut libc::semid_ds,
+    pub array: *mut u16,
+    #[cfg(any(target_os = "linux", target_os = "aix"))]
+    pub __buf: *mut libc::seminfo,
+}
+
+#[cfg(any(target_os = "macos", target_os = "openbsd"))]
+pub struct Semun {
+    pub val: i32,
+    pub buf: *mut libc::semid_ds,
+    pub array: *mut u16,
+}
+// ******************************************************************
+pub struct RsmCString {
+    // will likely use String or &str, but will keep this in case I want to use it
+    pub len: u16,
+    pub buf: [u8; MAX_STR_LEN + 1]
+}
+pub struct SQChan {
     pub type_: u8, // type of device
     pub options: u8, // type of specific options
     pub mode: u8, // how option is opened
     pub fid: i32, // OS supplied file id
-    // pub s: servertab 
+    pub s: ServerTab, // TODO: define 
     pub dx: u16, // $X
     pub dy: u16, // $Y
     pub name: [u8; MAX_SEQ_NAME], // name of what was opened
@@ -273,6 +319,119 @@ pub struct SQ_Chan {
     pub dkey: [u8; MAX_DKEY_LEN], // stored $KEY (null term)
     pub out_len: u16, // length of output terminator
     pub out_term: [u8; MAX_SEQ_OUT], // the output terminator
-    // pub in_term: IN_Term // routine for namespace
-    pub namespace: var_u // define the $IO stuff
+    pub in_term: InTerm, // TODO: define routine for namespace
+    pub namespace: VarU // define the $IO stuff
 } // sequential io
+
+pub struct UciTab {
+    pub name: VarU, // UCI name
+    pub global: u16 // define the UCI table
+}
+
+pub struct MsgData {
+    pub gbddata: *mut Gbd, // Gbd pointer
+    pub intdata: u16 // or an integer/block number
+}
+
+pub struct WdTab { // write daemon table
+    pub pid: u32,
+    pub doing: u32,
+    pub currmsg: MsgData
+}
+
+
+pub struct TranTab {
+    pub from_global: VarU, // from global
+    pub from_vol: u8, // volumeset
+    pub from_uci: u8, // UCI#
+    pub to_global: VarU, // to global
+    pub to_vol: u8, // volumeset
+    pub to_uci: u8 // UCI #
+}
+
+pub struct LabelBlock {
+    pub magic: u16, // RSM magic number
+    pub max_block: u16, // maximum block number
+    pub header_bytes: u16, // bytes in label/map
+    pub block_size: u16, // bytes per data block
+    pub volnam: VarU,
+    pub db_ver: u16,
+    pub creation_time: u64, // defined if RSM_DBVER=1
+    pub journal_available: u8, // jrnl turned on at startup
+    pub journal_requested: u8,
+    pub clean: u8,
+    pub journal_file: [char; JNL_FILENAME_MAX] // journal file name
+    pub uci: [UciTab; UCIS]
+}
+
+pub struct DBStat {
+    // database statistics
+    pub dbget: u16,
+    pub dbset: u16,
+    pub dbkil: u16,
+    pub dbdat: u16,
+    pub dbord: u16,
+    pub dbqry: u16,
+    pub lasttry: u16,
+    pub lastok: u16,
+    pub logrd: u16,
+    pub phyrd: u16,
+    pub logwt: u16,
+    pub phywt: u16,
+    pub blkalloc: u16,
+    pub blkreorg: u16, 
+    pub diskerrors: u16
+}
+
+#[repr(C)]
+pub struct VolDef {
+    pub vollab: *mut LabelBlock, // ptr to volset label block
+    pub map: std::ffi::c_void, // start of map area
+    pub first_free: std::ffi::c_void, // first word wiht free bits
+    pub gbd_hash: [*mut Gbd; GBD_HASH + 1], // Gbd hash table
+    pub gbd_head: *mut Gbd, // head of global buffer desc
+    pub num_gbd: u16, // number of global buffers
+    pub global_buf: std::ffi::c_void, // start of global buffers
+    pub zero_block: std::ffi::c_void, // empty block in memory
+    pub rbd_hash: [*mut Rbd; RBD_HASH + 1],
+    pub rbd_head: *mut Rbd, // head of routine buffer desc
+    pub num_rbd: u16, // number of routine buffers
+    pub num_of_daemons: u32,
+    pub wd_tab: [WdTab; MAX_DAEMONS], // write daemon info table
+    
+
+}
+pub struct LockTab {
+    pub fwd_link: *mut LockTab, // next tab pointer
+    pub size: u32, // num bytes
+    pub job: u16, // int job, -1 = free
+    pub lock_count: u16,
+    pub byte_count: u16,
+    pub vol: u8, // vol number
+    pub uci: u8, // UCI number (255 = local)
+    pub name: VarU, // var name
+    pub key: [u8; MAX_KEY_SIZE + 1] // key
+
+}
+
+#[repr(C)]
+pub struct SysTab{ // system tables
+    pub address: *mut std::ffi::c_void,
+    pub jobtab: *mut JobTab,
+    pub maxjob: u16, // max jobs allowed
+    pub sem_id: u32, // Gbd Semaphore ID
+    pub historic: u32, // E Notation, tag+off, $NEXT
+    pub precision: u32, // decimal precision
+    pub max_tt: u32, // max TRANTAB used,
+    pub tt: [TranTab; MAX_TRANTAB], // translation tables
+    pub start_user: u32, // user who started the environment
+    pub lockstart: *mut std::ffi::c_void, // head of lock table
+    pub locksize: u32, // num bytes
+    pub locktab: *mut LockTab, // head of used locks
+    pub lockfree: *mut LockTab, // head of lock free space
+    pub addoff: u64, // offset from systab to other buffers
+    pub addzie: u64, // other buffer size
+    pub vol: [*mut VolDef; MAX_VOL], // array of volume pointers
+    pub last_blk_used: [u32; MAX_VOL]
+
+}
